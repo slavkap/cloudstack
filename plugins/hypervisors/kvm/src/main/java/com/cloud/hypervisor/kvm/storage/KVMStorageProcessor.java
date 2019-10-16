@@ -116,8 +116,12 @@ import com.cloud.storage.template.QCOW2Processor;
 import com.cloud.storage.template.TemplateLocation;
 import com.cloud.utils.NumbersUtil;
 import com.cloud.utils.exception.CloudRuntimeException;
+import com.cloud.utils.script.OutputInterpreter;
 import com.cloud.utils.script.Script;
 import com.cloud.utils.storage.S3.S3Utils;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 public class KVMStorageProcessor implements StorageProcessor {
     private static final Logger s_logger = Logger.getLogger(KVMStorageProcessor.class);
@@ -888,6 +892,7 @@ public class KVMStorageProcessor implements StorageProcessor {
         Connect conn = null;
         KVMPhysicalDisk snapshotDisk = null;
         KVMStoragePool primaryPool = null;
+        boolean isKVMEnabled = cmd.getOptions().get("kvmsnapshot") !=null ? Boolean.parseBoolean(cmd.getOptions().get("kvmsnapshot") ): false;
         try {
             conn = LibvirtConnection.getConnectionByVmName(vmName);
 
@@ -947,25 +952,50 @@ public class KVMStorageProcessor implements StorageProcessor {
                     return new CopyCmdAnswer(e.toString());
                 }
             } else {
-                final Script command = new Script(_manageSnapshotPath, cmd.getWaitInMillSeconds(), s_logger);
-                command.add("-b", snapshotDisk.getPath());
-                command.add("-n", snapshotName);
-                command.add("-p", snapshotDestPath);
-                if (isCreatedFromVmSnapshot) {
-                    descName = UUID.randomUUID().toString();
-                }
-                command.add("-t", descName);
-                final String result = command.execute();
-                if (result != null) {
-                    s_logger.debug("Failed to backup snaptshot: " + result);
-                    return new CopyCmdAnswer(result);
-                }
-                final File snapFile = new File(snapshotDestPath + "/" + descName);
-                if(snapFile.exists()){
-                    size = snapFile.length();
+                if (isKVMEnabled) {
+                    QemuImgFile srcImg = new QemuImgFile(snapshot.getPath());
+                    OutputInterpreter.OneLineParser parser = new OutputInterpreter.OneLineParser();
+                    Script sc = new Script("virsh");
+                    sc.add(String.format("qemu-monitor-command %s '{ \"execute\" : \"query-block-jobs\" }'", vmName));
+                    sc.execute(parser);
+                    while (!isJobFinished(parser.getLine())) {
+                        try {
+                            Thread.sleep(5000);
+                            sc.execute(parser);
+                        } catch (InterruptedException e) {
+                            return new CopyCmdAnswer(e.getMessage());
+                      }
+                        /*                     sc = new Script("virsh");
+                        sc.add("qemu-monitor-command " + vmName + "  '{ \"execute\" : \"query-block-jobs\" }'");*/
+                    }
+                    try {
+                        final File snapFile = new File(snapshot.getPath());
+                        size = snapFile.exists() ? snapFile.length() : 0;
+                        FileUtils.moveFileToDirectory(snapFile, new File(snapshotDestPath), true);
+                    } catch (IOException e) {
+                        return new CopyCmdAnswer("Could not move to secondary " + e.getMessage());
+                    }
+                    s_logger.info("Backup executed successfuly");
+                } else {
+                    final Script command = new Script(_manageSnapshotPath, cmd.getWaitInMillSeconds(), s_logger);
+                    command.add("-b", snapshotDisk.getPath());
+                    command.add("-n", snapshotName);
+                    command.add("-p", snapshotDestPath);
+                    if (isCreatedFromVmSnapshot) {
+                        descName = UUID.randomUUID().toString();
+                    }
+                    command.add("-t", descName);
+                    final String result = command.execute();
+                    if (result != null) {
+                        s_logger.debug("Failed to backup snaptshot: " + result);
+                        return new CopyCmdAnswer(result);
+                    }
+                    final File snapFile = new File(snapshotDestPath + "/" + descName);
+                    if (snapFile.exists()) {
+                        size = snapFile.length();
+                    }
                 }
             }
-
             final SnapshotObjectTO newSnapshot = new SnapshotObjectTO();
             newSnapshot.setPath(snapshotRelPath + File.separator + descName);
             newSnapshot.setPhysicalSize(size);
@@ -996,17 +1026,19 @@ public class KVMStorageProcessor implements StorageProcessor {
                     final KVMStoragePool primaryStorage = storagePoolMgr.getStoragePool(primaryStore.getPoolType(),
                             primaryStore.getUuid());
                     if (state == DomainInfo.DomainState.VIR_DOMAIN_RUNNING && !primaryStorage.isExternalSnapshot()) {
-                        final DomainSnapshot snap = vm.snapshotLookupByName(snapshotName);
-                        snap.delete(0);
+                        if (!isKVMEnabled) {
+                            final DomainSnapshot snap = vm.snapshotLookupByName(snapshotName);
+                            snap.delete(0);
 
-                        /*
-                         * libvirt on RHEL6 doesn't handle resume event emitted from
-                         * qemu
-                         */
-                        vm = resource.getDomain(conn, vmName);
-                        state = vm.getInfo().state;
-                        if (state == DomainInfo.DomainState.VIR_DOMAIN_PAUSED) {
-                            vm.resume();
+                            /*
+                             * libvirt on RHEL6 doesn't handle resume event emitted from
+                             * qemu
+                             */
+                            vm = resource.getDomain(conn, vmName);
+                            state = vm.getInfo().state;
+                            if (state == DomainInfo.DomainState.VIR_DOMAIN_PAUSED) {
+                                vm.resume();
+                            }
                         }
                     } else {
                         if (primaryPool.getType() != StoragePoolType.RBD) {
@@ -1456,22 +1488,63 @@ public class KVMStorageProcessor implements StorageProcessor {
             final KVMPhysicalDisk disk = storagePoolMgr.getPhysicalDisk(primaryStore.getPoolType(), primaryStore.getUuid(), volume.getPath());
             if (state == DomainInfo.DomainState.VIR_DOMAIN_RUNNING && !primaryPool.isExternalSnapshot()) {
                 final String vmUuid = vm.getUUIDString();
-                final Object[] args = new Object[] {snapshotName, vmUuid};
-                final String snapshot = SnapshotXML.format(args);
+                boolean isKVMEnabled = cmd.getOptions().get("kvmsnapshot") !=null ? Boolean.parseBoolean(cmd.getOptions().get("kvmsnapshot") ): false;
+                if (isKVMEnabled) {
+                    long size = 0;
+                    OutputInterpreter.OneLineParser parser = new OutputInterpreter.OneLineParser();
+                    Script sc = new Script("virsh");
+                    sc.add(String.format("qemu-monitor-command %s '{ \"execute\" : \"query-block\" }'", vmName));
+                    sc.execute(parser);
+                    String json = parser.getLine();
+                    String path = disk.getPath();
+                    String snapshotDestPath = primaryPool.getLocalPath() + File.separator + "tmp";
+                    if (json != null) {
+                        String deviceName = getDeviceName(json, path);
+                        if (deviceName != null) {
+                            sc = new Script("virsh");
+                            try {
+                                FileUtils.forceMkdir(new File(snapshotDestPath));
+                            } catch (IOException e) {
+                                s_logger.debug("Could not create temporary directory for snapshot");
+                                return new CreateObjectAnswer("Could not create temporary directory for snapshot");
+                            }
+                            String snapshotPath = snapshotDestPath + File.separator + snapshotName;
+                            sc.add(String.format("qemu-monitor-command %s  '{ \"execute\" : \"drive-backup\", \"arguments\" : { \"device\" : \"%s\", \"target\" : \"%s\", \"sync\" : \"full\"   }  }'", vmName,deviceName,snapshotPath));
+                            String result = sc.execute(null);
+                            if (result.equals("0")) {
+                                final File snapFile = new File(snapshotDestPath + "/" + snapshotName);
+                                if (snapFile.exists()) {
+                                    size = snapFile.length();
+                                }
+                                final SnapshotObjectTO newSnapshot = new SnapshotObjectTO();
+                                newSnapshot.setPath(snapshotDestPath + File.separator + snapshotName);
+                                newSnapshot.setPhysicalSize(size);
+                                return new CreateObjectAnswer(newSnapshot);
+                            } else {
+                                s_logger.debug("Failed to backup snapshot: ");
+                                return new CreateObjectAnswer("failed to backup snapshot");
+                            }
+                        } else {
+                            return new CreateObjectAnswer("Could not find device for snapshot");
+                        }
+                    }
+                } else {
+                    final Object[] args = new Object[] { snapshotName, vmUuid };
+                    final String snapshot = SnapshotXML.format(args);
 
-                final long start = System.currentTimeMillis();
-                vm.snapshotCreateXML(snapshot);
-                final long total = (System.currentTimeMillis() - start)/1000;
-                s_logger.debug("snapshot takes " + total + " seconds to finish");
+                    final long start = System.currentTimeMillis();
+                    vm.snapshotCreateXML(snapshot);
+                    final long total = (System.currentTimeMillis() - start) / 1000;
+                    s_logger.debug("snapshot takes " + total + " seconds to finish");
 
-                /*
-                 * libvirt on RHEL6 doesn't handle resume event emitted from
-                 * qemu
-                 */
-                vm = resource.getDomain(conn, vmName);
-                state = vm.getInfo().state;
-                if (state == DomainInfo.DomainState.VIR_DOMAIN_PAUSED) {
-                    vm.resume();
+                    /*
+                     * libvirt on RHEL6 doesn't handle resume event emitted from qemu
+                     */
+                    vm = resource.getDomain(conn, vmName);
+                    state = vm.getInfo().state;
+                    if (state == DomainInfo.DomainState.VIR_DOMAIN_PAUSED) {
+                        vm.resume();
+                    }
                 }
             } else {
                 /**
@@ -1726,5 +1799,38 @@ public class KVMStorageProcessor implements StorageProcessor {
 
         DirectTemplateInformation info = downloader.getTemplateInformation();
         return new DirectDownloadAnswer(true, info.getSize(), info.getInstallPath());
+    }
+
+    private static String getDeviceName(String json, String path) {
+        JsonParser parser = new JsonParser();
+        JsonObject obj = (JsonObject) parser.parse(json);
+        if (obj.get("return").isJsonArray()) {
+            JsonArray arr = obj.get("return").getAsJsonArray();
+            for (int i = 0; i < arr.size(); i++) {
+                if (arr.get(i).isJsonObject()) {
+                    String deviceName = arr.get(i).getAsJsonObject().get("device").getAsString();
+                    if (arr.get(i).getAsJsonObject().has("inserted") && arr.get(i).getAsJsonObject().get("inserted").isJsonObject()) {
+                        JsonObject inserted = arr.get(i).getAsJsonObject().get("inserted").getAsJsonObject();
+                        if (inserted.get("file").getAsString().contains(path)) {
+                            System.out.println("right path");
+                            return deviceName;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isJobFinished(String json) {
+        JsonParser parser = new JsonParser();
+        JsonObject obj = (JsonObject) parser.parse(json);
+        if ( obj.get("return").isJsonArray()) {
+            JsonArray arr =  obj.get("return").getAsJsonArray();
+            if(arr.size() ==0) {
+                return true;
+            }
+        }
+        return false;
     }
 }

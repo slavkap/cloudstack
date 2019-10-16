@@ -48,6 +48,8 @@ import org.apache.cloudstack.framework.jobs.impl.AsyncJobVO;
 import org.apache.cloudstack.framework.jobs.impl.OutcomeImpl;
 import org.apache.cloudstack.framework.jobs.impl.VmWorkJobVO;
 import org.apache.cloudstack.jobs.JobInfo;
+import org.apache.cloudstack.storage.datastore.db.PrimaryDataStoreDao;
+import org.apache.cloudstack.storage.datastore.db.StoragePoolVO;
 import org.apache.cloudstack.storage.to.VolumeObjectTO;
 import org.apache.cloudstack.utils.identity.ManagementServerNode;
 
@@ -74,6 +76,7 @@ import com.cloud.storage.GuestOSVO;
 import com.cloud.storage.Snapshot;
 import com.cloud.storage.SnapshotVO;
 import com.cloud.storage.Storage.ImageFormat;
+import com.cloud.storage.Storage.StoragePoolType;
 import com.cloud.storage.Volume;
 import com.cloud.storage.Volume.Type;
 import com.cloud.storage.VolumeVO;
@@ -158,6 +161,8 @@ public class VMSnapshotManagerImpl extends MutualExclusiveIdsManagerBase impleme
     protected UserVmDetailsDao _userVmDetailsDao;
     @Inject
     protected VMSnapshotDetailsDao _vmSnapshotDetailsDao;
+    @Inject
+    protected  PrimaryDataStoreDao storagePool;
 
     VmWorkJobHandlerProxy _jobHandlerProxy = new VmWorkJobHandlerProxy(this);
 
@@ -330,7 +335,10 @@ public class VMSnapshotManagerImpl extends MutualExclusiveIdsManagerBase impleme
 
         // for KVM, only allow snapshot with memory when VM is in running state
         if (userVmVo.getHypervisorType() == HypervisorType.KVM && userVmVo.getState() == State.Running && !snapshotMemory) {
-            throw new InvalidParameterValueException("KVM VM does not allow to take a disk-only snapshot when VM is in running state");
+            boolean isKVMsnapshotsEnabled = Boolean.parseBoolean(_configDao.getValue("kvm.vmsnapshot.enabled"));
+            if (!isKVMsnapshotsEnabled) {
+                throw new InvalidParameterValueException("KVM VM does not allow to take a disk-only snapshot when VM is in running state");
+            }
         }
 
         // check access
@@ -349,8 +357,11 @@ public class VMSnapshotManagerImpl extends MutualExclusiveIdsManagerBase impleme
             if (activeSnapshots.size() > 0) {
                 throw new CloudRuntimeException("There is other active volume snapshot tasks on the instance to which the volume is attached, please try again later.");
             }
-            if (userVmVo.getHypervisorType() == HypervisorType.KVM && volume.getFormat() != ImageFormat.QCOW2) {
-                throw new CloudRuntimeException("We only support create vm snapshots from vm with QCOW2 image");
+            if (userVmVo.getHypervisorType() == HypervisorType.KVM && volume.getFormat() != ImageFormat.QCOW2 ) {
+                StoragePoolVO storagePoolVO = storagePool.findById(volume.getPoolId());
+                if (storagePoolVO.getPoolType() != StoragePoolType.RBD) {
+                    throw new CloudRuntimeException("We only support create vm snapshots from vm with QCOW2 image");
+                }
             }
         }
 

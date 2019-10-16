@@ -18,6 +18,7 @@
  */
 package org.apache.cloudstack.storage.vmsnapshot;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,14 +26,21 @@ import java.util.Map;
 import javax.inject.Inject;
 import javax.naming.ConfigurationException;
 
-import com.cloud.event.UsageEventVO;
-import org.apache.log4j.Logger;
-
+import org.apache.cloudstack.api.ApiErrorCode;
+import org.apache.cloudstack.api.ServerApiException;
+import org.apache.cloudstack.engine.subsystem.api.storage.SnapshotDataFactory;
+import org.apache.cloudstack.engine.subsystem.api.storage.SnapshotInfo;
+import org.apache.cloudstack.engine.subsystem.api.storage.SnapshotStrategy;
+import org.apache.cloudstack.engine.subsystem.api.storage.SnapshotStrategy.SnapshotOperation;
+import org.apache.cloudstack.engine.subsystem.api.storage.StorageStrategyFactory;
 import org.apache.cloudstack.engine.subsystem.api.storage.StrategyPriority;
 import org.apache.cloudstack.engine.subsystem.api.storage.VMSnapshotOptions;
 import org.apache.cloudstack.engine.subsystem.api.storage.VMSnapshotStrategy;
+import org.apache.cloudstack.engine.subsystem.api.storage.VolumeDataFactory;
+import org.apache.cloudstack.engine.subsystem.api.storage.VolumeInfo;
 import org.apache.cloudstack.framework.config.dao.ConfigurationDao;
 import org.apache.cloudstack.storage.to.VolumeObjectTO;
+import org.apache.log4j.Logger;
 
 import com.cloud.agent.AgentManager;
 import com.cloud.agent.api.Answer;
@@ -40,27 +48,43 @@ import com.cloud.agent.api.CreateVMSnapshotAnswer;
 import com.cloud.agent.api.CreateVMSnapshotCommand;
 import com.cloud.agent.api.DeleteVMSnapshotAnswer;
 import com.cloud.agent.api.DeleteVMSnapshotCommand;
+import com.cloud.agent.api.FreezeVMAnswer;
+import com.cloud.agent.api.FreezeVMCommand;
 import com.cloud.agent.api.RevertToVMSnapshotAnswer;
 import com.cloud.agent.api.RevertToVMSnapshotCommand;
+import com.cloud.agent.api.ThawVMAnswer;
+import com.cloud.agent.api.ThawVMCommand;
 import com.cloud.agent.api.VMSnapshotTO;
 import com.cloud.event.EventTypes;
 import com.cloud.event.UsageEventUtils;
+import com.cloud.event.UsageEventVO;
 import com.cloud.exception.AgentUnavailableException;
 import com.cloud.exception.OperationTimedoutException;
 import com.cloud.host.HostVO;
 import com.cloud.host.dao.HostDao;
+import com.cloud.hypervisor.Hypervisor;
+import com.cloud.storage.CreateSnapshotPayload;
 import com.cloud.storage.DiskOfferingVO;
 import com.cloud.storage.GuestOSHypervisorVO;
 import com.cloud.storage.GuestOSVO;
+import com.cloud.storage.Snapshot;
+import com.cloud.storage.SnapshotVO;
+import com.cloud.storage.VolumeApiService;
 import com.cloud.storage.VolumeVO;
 import com.cloud.storage.dao.DiskOfferingDao;
 import com.cloud.storage.dao.GuestOSDao;
 import com.cloud.storage.dao.GuestOSHypervisorDao;
+import com.cloud.storage.dao.SnapshotDao;
 import com.cloud.storage.dao.VolumeDao;
+import com.cloud.storage.snapshot.SnapshotApiService;
+import com.cloud.user.AccountService;
 import com.cloud.uservm.UserVm;
 import com.cloud.utils.NumbersUtil;
 import com.cloud.utils.component.ManagerBase;
 import com.cloud.utils.db.DB;
+import com.cloud.utils.db.SearchBuilder;
+import com.cloud.utils.db.SearchCriteria;
+import com.cloud.utils.db.SearchCriteria.Op;
 import com.cloud.utils.db.Transaction;
 import com.cloud.utils.db.TransactionCallbackWithExceptionNoReturn;
 import com.cloud.utils.db.TransactionStatus;
@@ -95,6 +119,20 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
     DiskOfferingDao diskOfferingDao;
     @Inject
     HostDao hostDao;
+    @Inject
+    VolumeApiService _volumeService;
+    @Inject
+    AccountService _accountService;
+    @Inject
+    VolumeDataFactory volumeDataFactory;
+    @Inject
+    SnapshotApiService _snapshotService;
+    @Inject
+    SnapshotDao _snapshotDao;
+    @Inject
+    StorageStrategyFactory _storageStrategyFactory;
+    @Inject
+    SnapshotDataFactory _snapshotDataFactory;
 
     @Override
     public boolean configure(String name, Map<String, Object> params) throws ConfigurationException {
@@ -108,8 +146,14 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
         Long hostId = vmSnapshotHelper.pickRunningHost(vmSnapshot.getVmId());
         UserVm userVm = userVmDao.findById(vmSnapshot.getVmId());
         VMSnapshotVO vmSnapshotVO = (VMSnapshotVO)vmSnapshot;
+        boolean isKVMsnapshotsEnabled = Boolean.parseBoolean(configurationDao.getValue("kvm.vmsnapshot.enabled"));
+
         try {
-            vmSnapshotHelper.vmSnapshotStateTransitTo(vmSnapshotVO, VMSnapshot.Event.CreateRequested);
+            if (userVm.getHypervisorType() ==Hypervisor.HypervisorType.KVM && vmSnapshotVO.getType().equals(VMSnapshot.Type.Disk) && isKVMsnapshotsEnabled) {
+                vmSnapshotHelper.vmSnapshotStateTransitTo(vmSnapshotVO, VMSnapshot.Event.KVMCreateRequested);
+            }else {
+                vmSnapshotHelper.vmSnapshotStateTransitTo(vmSnapshotVO, VMSnapshot.Event.CreateRequested);
+            }
         } catch (NoTransitionException e) {
             throw new CloudRuntimeException(e.getMessage());
         }
@@ -148,14 +192,105 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
             GuestOSHypervisorVO guestOsMapping = guestOsHypervisorDao.findByOsIdAndHypervisor(guestOS.getId(), host.getHypervisorType().toString(), host.getHypervisorVersion());
 
             CreateVMSnapshotCommand ccmd = new CreateVMSnapshotCommand(userVm.getInstanceName(), userVm.getUuid(), target, volumeTOs, guestOS.getDisplayName());
-            if (guestOsMapping == null) {
-                ccmd.setPlatformEmulator(null);
-            } else {
-                ccmd.setPlatformEmulator(guestOsMapping.getGuestOsName());
-            }
-            ccmd.setWait(_wait);
+            if (userVm.getHypervisorType().equals(Hypervisor.HypervisorType.KVM)
+                    && vmSnapshotVO.getType().equals(VMSnapshot.Type.Disk) && isKVMsnapshotsEnabled) {
+                s_logger.info("Creating VM snapshot for KVM hypervisor without memory");
 
-            answer = (CreateVMSnapshotAnswer)agentMgr.send(hostId, ccmd);
+                FreezeVMCommand freezeCommand = new FreezeVMCommand(userVm.getInstanceName());
+                FreezeVMAnswer freezeAnswer = (FreezeVMAnswer) agentMgr.send(hostId, freezeCommand);
+                if (freezeAnswer != null && freezeAnswer.getResult()) {
+                    s_logger.info("The virtual machine is frozen");
+                    ThawVMCommand freeCmd = new ThawVMCommand(userVm.getInstanceName());
+                    ThawVMAnswer answerThaw = null;
+                    List<VolumeInfo> vinfos = new ArrayList<>();
+                    List<SnapshotInfo> forRollback = new ArrayList<>();
+                    for (VolumeObjectTO volumeObjectTO : volumeTOs) {
+                        vinfos.add(volumeDataFactory.getVolume(volumeObjectTO.getId()));
+                    }
+                    try {
+                        for (VolumeInfo vol : vinfos) {
+                            try {
+                                    String snapshotName = vmSnapshot.getUuid() + "_" + vol.getUuid();
+                                    SnapshotVO snapshotCreate = new SnapshotVO(vol.getDataCenterId(), vol.getAccountId(), vol.getDomainId(), vol.getId(), vol.getDiskOfferingId(),
+                                            snapshotName, (short) SnapshotVO.MANUAL_POLICY_ID, "MANUAL", vol.getSize(), vol.getMinIops(), vol.getMaxIops(), Hypervisor.HypervisorType.KVM, null);
+                                    snapshotCreate.setState(Snapshot.State.AllocatedKVM);
+                                    SnapshotVO snapshot = _snapshotDao.persist(snapshotCreate);
+                                    vol.addPayload(setPayload(quiescevm, vol, snapshotCreate, snapshot));
+                                    SnapshotInfo snapshotInfo = _snapshotDataFactory.getSnapshot(snapshot.getId(), vol.getDataStore());
+                                    snapshotInfo.addPayload(vol.getpayload());
+                                    SnapshotStrategy  snapshotStrategy = _storageStrategyFactory.getSnapshotStrategy(snapshotInfo, SnapshotOperation.TAKE);
+                                    if (snapshotStrategy ==null) {
+                                        throw new CloudRuntimeException("Could not find strategy for snapshot uuid:" + snapshotInfo.getUuid());
+                                    }
+                                    SnapshotInfo snapInfo = snapshotStrategy.takeSnapshot(snapshotInfo);
+                                    if (snapInfo == null) {
+                                        throw new CloudRuntimeException("Failed to create snapshot");
+                                    }else {
+                                        forRollback.add(snapInfo);
+                                    }
+                                    s_logger.info("Created snapshot for volume with snapshot ID: " + snapInfo.getId());
+                                } catch (CloudRuntimeException e) {
+                                    for (SnapshotInfo snapshotInfo : forRollback) {
+                                        Long snapshotID =snapshotInfo.getId();
+                                        SnapshotVO snapshot = _snapshotDao.findById(snapshotID);
+                                        snapshot.setState(Snapshot.State.BackedUp);
+                                        _snapshotDao.persist(snapshot);
+                                        _snapshotService.deleteSnapshot(snapshot.getId());
+                                        s_logger.debug("Deleting snapshot with id:" + snapshotID);
+                                    }
+                                    throw new CloudRuntimeException("Could not create snapshot for VM snapshot" + e.getMessage());
+                                }
+                        }
+                        answer = new CreateVMSnapshotAnswer(ccmd, true, "");
+                        answer.setVolumeTOs(volumeTOs);
+                        answerThaw = (ThawVMAnswer) agentMgr.send(hostId, freeCmd);
+                        if (answerThaw != null && answerThaw.getResult()) {
+                            s_logger.info("Thaw vm answe:" + answerThaw.getDetails());
+                            for (VolumeInfo vol : vinfos) {
+                                CreateSnapshotPayload payload = (CreateSnapshotPayload) vol.getpayload();
+                                Long snapshotId = payload.getSnapshotId();
+                                SnapshotInfo snapshotInfo = _snapshotDataFactory.getSnapshot(snapshotId, vol.getDataStore());
+                                snapshotInfo.addPayload(vol.getpayload());
+                                try {
+                                    SnapshotStrategy snapshotStrategy = _storageStrategyFactory.getSnapshotStrategy(snapshotInfo, SnapshotOperation.TAKE);
+                                    SnapshotInfo snInfo = snapshotStrategy.backupSnapshot(snapshotInfo);
+                                    if (snInfo ==null) {
+                                        throw new CloudRuntimeException("Could not backup snapshot for volume");
+                                    }
+                                    s_logger.info(String.format("Backedup snapshot with id=%s, path=%s", snInfo.getId(), snInfo.getPath()));
+                                } catch (Exception e) {
+                                    for (SnapshotInfo snapshotIn : forRollback) {
+                                        Long snapshotID =snapshotIn.getId();
+                                        SnapshotVO snapshot = _snapshotDao.findById(snapshotID);
+                                        snapshot.setState(Snapshot.State.BackedUp);
+                                        _snapshotDao.persist(snapshot);
+                                        _snapshotService.deleteSnapshot(snapshot.getId());
+                                        s_logger.debug("Deleting snapshot with id:" + snapshotID);
+                                    }
+                                    throw new CloudRuntimeException("Could not backup snapshot for volume " + e.getMessage());
+                                }
+                            }
+                        }
+                    } catch (CloudRuntimeException e) {
+                        throw new CloudRuntimeException("Could not create vm snapsot for " + vmSnapshot.getName());
+                    } finally {
+                        if(answerThaw == null) {
+                            answerThaw =  (ThawVMAnswer) agentMgr.send(hostId, freeCmd);
+                        }
+                    }
+                } else {
+                    throw new CloudRuntimeException("Could not freeze VM." + freezeAnswer.getDetails());
+                }
+            } else {
+                if (guestOsMapping == null) {
+                    ccmd.setPlatformEmulator(null);
+                } else {
+                    ccmd.setPlatformEmulator(guestOsMapping.getGuestOsName());
+                }
+                ccmd.setWait(_wait);
+
+                answer = (CreateVMSnapshotAnswer) agentMgr.send(hostId, ccmd);
+            }
             if (answer != null && answer.getResult()) {
                 processAnswer(vmSnapshotVO, userVm, answer, hostId);
                 s_logger.debug("Create vm snapshot " + vmSnapshot.getName() + " succeeded for vm: " + userVm.getInstanceName());
@@ -215,23 +350,52 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
             GuestOSVO guestOS = guestOSDao.findById(userVm.getGuestOSId());
             DeleteVMSnapshotCommand deleteSnapshotCommand = new DeleteVMSnapshotCommand(vmInstanceName, vmSnapshotTO, volumeTOs, guestOS.getDisplayName());
 
-            Answer answer = agentMgr.send(hostId, deleteSnapshotCommand);
+            Answer answer = null;
 
-            if (answer != null && answer.getResult()) {
-                DeleteVMSnapshotAnswer deleteVMSnapshotAnswer = (DeleteVMSnapshotAnswer)answer;
-                processAnswer(vmSnapshotVO, userVm, answer, hostId);
-                long full_chain_size=0;
-                for (VolumeObjectTO volumeTo : deleteVMSnapshotAnswer.getVolumeTOs()) {
-                    publishUsageEvent(EventTypes.EVENT_VM_SNAPSHOT_DELETE, vmSnapshot, userVm, volumeTo);
-                    full_chain_size += volumeTo.getSize();
+            boolean isKVMsnapshotsEnabled = Boolean.parseBoolean(configurationDao.getValue("kvm.vmsnapshot.enabled"));
+            if (userVm.getHypervisorType() == Hypervisor.HypervisorType.KVM  && vmSnapshotVO.getType().equals(VMSnapshot.Type.Disk) && isKVMsnapshotsEnabled) {
+                List<VolumeInfo> volumeInfos = new ArrayList<>();
+                for (VolumeObjectTO volumeObjectTO : volumeTOs) {
+                    volumeInfos.add(volumeDataFactory.getVolume(volumeObjectTO.getId()));
                 }
-                publishUsageEvent(EventTypes.EVENT_VM_SNAPSHOT_OFF_PRIMARY, vmSnapshot, userVm, full_chain_size, 0L);
-                return true;
+                for (VolumeInfo vol : volumeInfos) {
+                    try {
+                        String snapshotName = vmSnapshot.getUuid() + "_" + vol.getUuid();
+                        SnapshotVO snapshot = findSnapshotByName(snapshotName);
+
+                        if (snapshot == null) {
+                            throw new CloudRuntimeException("Could not delete snapshot for VM snapshot");
+                        }
+
+                        snapshot.setState(Snapshot.State.BackedUp);
+                        _snapshotDao.persist(snapshot);
+                        boolean snapshotForDelete = _snapshotService.deleteSnapshot(snapshot.getId());
+                        if (!snapshotForDelete) {
+                            throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, "Failed to delete snapshot");
+                        }
+                    } catch (CloudRuntimeException e) {
+                        throw new CloudRuntimeException("Could not delete snapshot for VM snapshot" + e.getMessage());
+                    }
+                }
+                answer = new DeleteVMSnapshotAnswer(deleteSnapshotCommand, volumeTOs);
             } else {
-                String errMsg = (answer == null) ? null : answer.getDetails();
-                s_logger.error("Delete vm snapshot " + vmSnapshot.getName() + " of vm " + userVm.getInstanceName() + " failed due to " + errMsg);
-                throw new CloudRuntimeException("Delete vm snapshot " + vmSnapshot.getName() + " of vm " + userVm.getInstanceName() + " failed due to " + errMsg);
+                answer = agentMgr.send(hostId, deleteSnapshotCommand);
             }
+                if (answer != null && answer.getResult()) {
+                    DeleteVMSnapshotAnswer deleteVMSnapshotAnswer = (DeleteVMSnapshotAnswer) answer;
+                    processAnswer(vmSnapshotVO, userVm, answer, hostId);
+                    long full_chain_size = 0;
+                    for (VolumeObjectTO volumeTo : deleteVMSnapshotAnswer.getVolumeTOs()) {
+                        publishUsageEvent(EventTypes.EVENT_VM_SNAPSHOT_DELETE, vmSnapshot, userVm, volumeTo);
+                        full_chain_size += volumeTo.getSize();
+                    }
+                    publishUsageEvent(EventTypes.EVENT_VM_SNAPSHOT_OFF_PRIMARY, vmSnapshot, userVm, full_chain_size, 0L);
+                    return true;
+                } else {
+                    String errMsg = (answer == null) ? null : answer.getDetails();
+                    s_logger.error("Delete vm snapshot " + vmSnapshot.getName() + " of vm " + userVm.getInstanceName() + " failed due to " + errMsg);
+                    throw new CloudRuntimeException("Delete vm snapshot " + vmSnapshot.getName() + " of vm " + userVm.getInstanceName() + " failed due to " + errMsg);
+                }
         } catch (OperationTimedoutException e) {
             throw new CloudRuntimeException("Delete vm snapshot " + vmSnapshot.getName() + " of vm " + userVm.getInstanceName() + " failed due to " + e.getMessage());
         } catch (AgentUnavailableException e) {
@@ -268,7 +432,7 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
     }
 
     protected void finalizeDelete(VMSnapshotVO vmSnapshot, List<VolumeObjectTO> volumeTOs) {
-        // update volumes path
+        // update volumes paths
         updateVolumePath(volumeTOs);
 
         // update children's parent snapshots
@@ -390,8 +554,37 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
             } else {
                 revertToSnapshotCommand.setPlatformEmulator(guestOsMapping.getGuestOsName());
             }
+            //For KVM VM snapshots without memory and the disk could be in different storage providers
+            boolean isKVMsnapshotsEnabled = Boolean.parseBoolean(configurationDao.getValue("kvm.vmsnapshot.enabled"));
 
-            RevertToVMSnapshotAnswer answer = (RevertToVMSnapshotAnswer)agentMgr.send(hostId, revertToSnapshotCommand);
+            RevertToVMSnapshotAnswer answer= null;
+            s_logger.info("KVM snapshot is enabled " + isKVMsnapshotsEnabled);
+            if (userVm.getHypervisorType().equals(Hypervisor.HypervisorType.KVM) && vmSnapshotVO.getType().equals(VMSnapshot.Type.Disk) && isKVMsnapshotsEnabled) {
+                List<VolumeInfo> volumeInfos = new ArrayList<>();
+                for (VolumeObjectTO volumeObjectTO : volumeTOs) {
+                    volumeInfos.add(volumeDataFactory.getVolume(volumeObjectTO.getId()));
+                }
+                for (VolumeInfo vol : volumeInfos) {
+                    try {
+                        String snapshotName = vmSnapshot.getUuid() + "_" + vol.getUuid();
+                        s_logger.info("snapshot name " + snapshotName);
+                        SnapshotVO snap = findSnapshotByName(snapshotName);
+                        Snapshot snap2 = _snapshotService.revertSnapshot(snap.getId());
+                        if (snap2 == null) {
+                            throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, "Failed to revert snapshot");
+                        }
+                    } catch (Exception e) {
+                        throw new CloudRuntimeException("Could not revert snapshot for VM snapshot" + e.getMessage());
+                    }
+                }
+                answer = new RevertToVMSnapshotAnswer(revertToSnapshotCommand, true, "");
+                answer.setVolumeTOs(volumeTOs);
+                if (answer ==null || !answer.getResult()) {
+                    throw new CloudRuntimeException("Could not create vm snapsot for " + vmSnapshot.getName());
+                }
+            }else {
+                answer = (RevertToVMSnapshotAnswer)agentMgr.send(hostId, revertToSnapshotCommand);
+            }
             if (answer != null && answer.getResult()) {
                 processAnswer(vmSnapshotVO, userVm, answer, hostId);
                 result = true;
@@ -420,6 +613,14 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
         return result;
     }
 
+    private SnapshotVO findSnapshotByName(String snapshotName) {
+        SearchBuilder<SnapshotVO> sb = _snapshotDao.createSearchBuilder();
+        SearchCriteria<SnapshotVO> sc = sb.create();
+        sc.addAnd("name", Op.EQ, snapshotName);
+        SnapshotVO snap = _snapshotDao.findOneBy(sc);
+        return snap;
+    }
+
     @Override
     public StrategyPriority canHandle(VMSnapshot vmSnapshot) {
         return StrategyPriority.DEFAULT;
@@ -440,5 +641,17 @@ public class DefaultVMSnapshotStrategy extends ManagerBase implements VMSnapshot
             publishUsageEvent(EventTypes.EVENT_VM_SNAPSHOT_DELETE, vmSnapshot, userVm, volumeTo);
         }
         return vmSnapshotDao.remove(vmSnapshot.getId());
+    }
+
+    private CreateSnapshotPayload setPayload(boolean quiescevm, VolumeInfo vol, SnapshotVO snapshotCreate,
+            SnapshotVO snapshot) {
+        CreateSnapshotPayload payload = new CreateSnapshotPayload();
+        payload.setSnapshotId(snapshot.getId());
+        payload.setSnapshotPolicyId(SnapshotVO.MANUAL_POLICY_ID);
+        payload.setLocationType(snapshotCreate.getLocationType());
+        payload.setAccount(_accountService.getAccount(vol.getAccountId()));
+        payload.setAsyncBackup(false);
+        payload.setQuiescevm(quiescevm);
+        return payload;
     }
 }

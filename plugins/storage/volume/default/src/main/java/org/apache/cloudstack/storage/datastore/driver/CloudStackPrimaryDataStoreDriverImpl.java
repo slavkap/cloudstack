@@ -67,6 +67,7 @@ import com.cloud.host.dao.HostDao;
 import com.cloud.storage.CreateSnapshotPayload;
 import com.cloud.storage.DataStoreRole;
 import com.cloud.storage.ResizeVolumePayload;
+import com.cloud.storage.Snapshot;
 import com.cloud.storage.Storage;
 import com.cloud.storage.StorageManager;
 import com.cloud.storage.StoragePool;
@@ -309,6 +310,10 @@ public class CloudStackPrimaryDataStoreDriverImpl implements PrimaryDataStoreDri
                 s_logger.error(errMsg);
                 answer = new Answer(cmd, false, errMsg);
             } else {
+                boolean isKVMsnapshotsEnabled = Boolean.parseBoolean(configDao.getValue("kvm.vmsnapshot.enabled"));
+                Map<String, String> options = new HashMap<>();
+                options.put("kvmsnapshot", ((isKVMsnapshotsEnabled && snapshot.getState() == Snapshot.State.AllocatedKVM ) ? "true" : "false"));
+                cmd.setOptions(options);
                 answer = ep.sendMessage(cmd);
             }
 

@@ -62,6 +62,7 @@ import com.cloud.configuration.Config;
 import com.cloud.host.Host;
 import com.cloud.hypervisor.Hypervisor;
 import com.cloud.storage.DataStoreRole;
+import com.cloud.storage.Snapshot;
 import com.cloud.storage.StorageManager;
 import com.cloud.storage.Storage.StoragePoolType;
 import com.cloud.storage.StoragePool;
@@ -525,8 +526,10 @@ public class AncientDataMotionStrategy implements DataMotionStrategy {
         if (snapshotFullBackup != null) {
             fullSnapshot = snapshotFullBackup;
         }
+        boolean isKVMsnapshotsEnabled = Boolean.parseBoolean(configDao.getValue("kvm.vmsnapshot.enabled"));
         Map<String, String> options = new HashMap<String, String>();
         options.put("fullSnapshot", fullSnapshot.toString());
+        options.put("kvmsnapshot", (isKVMsnapshotsEnabled && snapshotInfo.getState().equals(Snapshot.State.BackingUpForVM) ? "true" : "false"));
         Answer answer = null;
         try {
             if (needCacheStorage(srcData, destData)) {

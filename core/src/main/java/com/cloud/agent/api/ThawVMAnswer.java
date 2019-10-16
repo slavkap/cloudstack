@@ -17,45 +17,23 @@
 // under the License.
 //
 
-package org.apache.cloudstack.storage.command;
+package com.cloud.agent.api;
 
-import java.util.HashMap;
-import java.util.Map;
+public class ThawVMAnswer extends Answer {
 
-import com.cloud.agent.api.to.DataTO;
-
-public final class CreateObjectCommand extends StorageSubSystemCommand {
-    private DataTO data;
-    private Map<String,String> options = new HashMap<>();
-
-    public CreateObjectCommand(final DataTO obj) {
-        super();
-        data = obj;
-    }
-
-    protected CreateObjectCommand() {
+    public ThawVMAnswer() {
         super();
     }
 
-    @Override
-    public boolean executeInSequence() {
-        return false;
+    public ThawVMAnswer(ThawVMCommand command, boolean success, String details) {
+        super(command, success, details);
     }
 
-    public DataTO getData() {
-        return data;
+    public ThawVMAnswer(ThawVMCommand command, Exception e) {
+        super(command, e);
     }
 
-    public Map<String, String> getOptions() {
-        return options;
-    }
-
-    public void setOptions(Map<String, String> options) {
-        this.options = options;
-    }
-
-    @Override
-    public void setExecuteInSequence(final boolean inSeq) {
-
+    public ThawVMAnswer(ThawVMCommand command) {
+        super(command);
     }
 }

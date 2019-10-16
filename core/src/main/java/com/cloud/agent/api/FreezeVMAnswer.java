@@ -17,45 +17,24 @@
 // under the License.
 //
 
-package org.apache.cloudstack.storage.command;
+package com.cloud.agent.api;
 
-import java.util.HashMap;
-import java.util.Map;
+public class FreezeVMAnswer extends Answer{
 
-import com.cloud.agent.api.to.DataTO;
-
-public final class CreateObjectCommand extends StorageSubSystemCommand {
-    private DataTO data;
-    private Map<String,String> options = new HashMap<>();
-
-    public CreateObjectCommand(final DataTO obj) {
-        super();
-        data = obj;
-    }
-
-    protected CreateObjectCommand() {
+    public FreezeVMAnswer() {
         super();
     }
 
-    @Override
-    public boolean executeInSequence() {
-        return false;
+    public FreezeVMAnswer(FreezeVMCommand command, boolean success, String details) {
+        super(command, success, details);
     }
 
-    public DataTO getData() {
-        return data;
+    public FreezeVMAnswer(FreezeVMCommand command, Exception e) {
+        super(command, e);
     }
 
-    public Map<String, String> getOptions() {
-        return options;
+    public FreezeVMAnswer(FreezeVMCommand command) {
+        super(command);
     }
 
-    public void setOptions(Map<String, String> options) {
-        this.options = options;
-    }
-
-    @Override
-    public void setExecuteInSequence(final boolean inSeq) {
-
-    }
 }

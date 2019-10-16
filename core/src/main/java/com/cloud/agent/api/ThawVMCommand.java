@@ -17,24 +17,21 @@
 // under the License.
 //
 
-package org.apache.cloudstack.storage.command;
+package com.cloud.agent.api;
 
-import java.util.HashMap;
-import java.util.Map;
+public class ThawVMCommand extends Command{
+    protected String vmName;
 
-import com.cloud.agent.api.to.DataTO;
-
-public final class CreateObjectCommand extends StorageSubSystemCommand {
-    private DataTO data;
-    private Map<String,String> options = new HashMap<>();
-
-    public CreateObjectCommand(final DataTO obj) {
-        super();
-        data = obj;
+    public ThawVMCommand(String vmName) {
+        this.vmName = vmName;
     }
 
-    protected CreateObjectCommand() {
-        super();
+    public String getVmName() {
+        return vmName;
+    }
+
+    public void setVmName(String vmName) {
+        this.vmName = vmName;
     }
 
     @Override
@@ -42,20 +39,4 @@ public final class CreateObjectCommand extends StorageSubSystemCommand {
         return false;
     }
 
-    public DataTO getData() {
-        return data;
-    }
-
-    public Map<String, String> getOptions() {
-        return options;
-    }
-
-    public void setOptions(Map<String, String> options) {
-        this.options = options;
-    }
-
-    @Override
-    public void setExecuteInSequence(final boolean inSeq) {
-
-    }
 }
